@@ -32,7 +32,8 @@ db.exec(`
         target_timestamp INTEGER,
         timezone_name TEXT,
         original_time_str TEXT,
-        mention_type TEXT DEFAULT 'user', -- 'user' atau 'here'
+        mention_type TEXT DEFAULT 'user', -- 'user', 'here', atau 'role'
+        target_role_id TEXT DEFAULT NULL,
         reminded_1d INTEGER DEFAULT 0,
         reminded_2h INTEGER DEFAULT 0,
         reminded_0m INTEGER DEFAULT 0,
@@ -41,10 +42,9 @@ db.exec(`
     );
 `);
 
-// Auto-Migration jika table lama belum punya kolom mention_type
-try { 
-    db.exec("ALTER TABLE reminders ADD COLUMN mention_type TEXT DEFAULT 'user';"); 
-} catch (e) {}
+// Auto-Migration Database jika kolom belum ada
+try { db.exec("ALTER TABLE reminders ADD COLUMN mention_type TEXT DEFAULT 'user';"); } catch (e) {}
+try { db.exec("ALTER TABLE reminders ADD COLUMN target_role_id TEXT DEFAULT NULL;"); } catch (e) {}
 
 // Inisialisasi Discord Client
 const client = new Client({
@@ -93,12 +93,17 @@ const commands = [
         )
         .addStringOption(opt =>
             opt.setName('target')
-               .setDescription('Siapa yang ingin di-tag saat pengingat berbunyi? (Default: Diri Sendiri)')
+               .setDescription('Target mention standar (Default: Diri Sendiri)')
                .setRequired(false)
                .addChoices(
                    { name: '👤 Diri Sendiri (Tag Pembuat)', value: 'user' },
                    { name: '📢 Seluruh Server (Tag @here)', value: 'here' }
                )
+        )
+        .addRoleOption(opt =>
+            opt.setName('role')
+               .setDescription('Pilih Role spesifik yang ingin di-tag (Opsional, menimpa pilihan target)')
+               .setRequired(false)
         )
         .addChannelOption(opt =>
             opt.setName('channel')
@@ -163,9 +168,20 @@ client.once('clientReady', async () => {
         console.error('❌ Gagal mendaftarkan slash command:', error);
     }
 
-    // Jalankan background worker pemeriksa reminder tiap 30 detik
+    // Background worker tiap 30 detik
     setInterval(checkAndSendReminders, 30 * 1000);
 });
+
+// Helper Format Tag Target
+function getTargetMention(rem) {
+    if (rem.target_role_id) {
+        return `<@&${rem.target_role_id}>`;
+    }
+    if (rem.mention_type === 'here') {
+        return '@here';
+    }
+    return `<@${rem.user_id}>`;
+}
 
 // ==========================================
 // BACKGROUND REMINDER WORKER (3 TAHAP)
@@ -185,8 +201,7 @@ async function checkAndSendReminders() {
             const channel = await client.channels.fetch(rem.channel_id).catch(() => null);
             if (!channel) continue;
 
-            const isServerReminder = rem.mention_type === 'here';
-            const mentionText = isServerReminder ? '@here' : `<@${rem.user_id}>`;
+            const mentionText = getTargetMention(rem);
 
             // 1. TAHAP 1: H-1 Hari (24 Jam)
             if (timeLeft <= oneDayMs && timeLeft > twoHoursMs && rem.reminded_1d === 0) {
@@ -206,7 +221,7 @@ async function checkAndSendReminders() {
                 await channel.send({ 
                     content: mentionText, 
                     embeds: [embed1d],
-                    allowedMentions: { parse: ['everyone', 'users'] }
+                    allowedMentions: { parse: ['everyone', 'roles', 'users'] }
                 });
             }
 
@@ -227,7 +242,7 @@ async function checkAndSendReminders() {
                 await channel.send({ 
                     content: mentionText, 
                     embeds: [embed2h],
-                    allowedMentions: { parse: ['everyone', 'users'] }
+                    allowedMentions: { parse: ['everyone', 'roles', 'users'] }
                 });
             }
 
@@ -249,7 +264,7 @@ async function checkAndSendReminders() {
                 await channel.send({ 
                     content: `🔔 ${mentionText} **Waktunya ${rem.title}!**`, 
                     embeds: [embed0m],
-                    allowedMentions: { parse: ['everyone', 'users'] }
+                    allowedMentions: { parse: ['everyone', 'roles', 'users'] }
                 });
             }
 
@@ -270,7 +285,8 @@ client.on('interactionCreate', async interaction => {
         const title = interaction.options.getString('title');
         const rawDateTime = interaction.options.getString('datetime');
         const tzKey = interaction.options.getString('timezone');
-        const targetType = interaction.options.getString('target') || 'user';
+        const targetTypeOption = interaction.options.getString('target') || 'user';
+        const targetRole = interaction.options.getRole('role');
         const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
 
         const parsedDate = parseFlexibleDateTime(rawDateTime, tzKey);
@@ -292,10 +308,19 @@ client.on('interactionCreate', async interaction => {
             });
         }
 
-        // Simpan ke SQLite beserta mention_type
+        // Tentukan tipe mention dan ID role jika diisi
+        let mentionType = targetTypeOption;
+        let targetRoleId = null;
+
+        if (targetRole) {
+            mentionType = 'role';
+            targetRoleId = targetRole.id;
+        }
+
+        // Simpan ke SQLite
         const stmt = db.prepare(`
-            INSERT INTO reminders (guild_id, channel_id, user_id, title, target_timestamp, timezone_name, original_time_str, mention_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO reminders (guild_id, channel_id, user_id, title, target_timestamp, timezone_name, original_time_str, mention_type, target_role_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         const info = stmt.run(
             interaction.guildId,
@@ -305,11 +330,18 @@ client.on('interactionCreate', async interaction => {
             targetTimestamp,
             tzKey,
             rawDateTime,
-            targetType
+            mentionType,
+            targetRoleId
         );
 
         const unixSeconds = Math.floor(targetTimestamp / 1000);
-        const targetLabel = targetType === 'here' ? '📢 Seluruh Server (`@here`)' : `👤 Pribadi (<@${interaction.user.id}>)`;
+
+        let targetLabel = `👤 Pribadi (<@${interaction.user.id}>)`;
+        if (targetRoleId) {
+            targetLabel = `🛡️ Role (<@&${targetRoleId}>)`;
+        } else if (mentionType === 'here') {
+            targetLabel = '📢 Seluruh Server (`@here`)';
+        }
 
         const embedSuccess = new EmbedBuilder()
             .setTitle('✅ Pengingat Berhasil Dibuat!')
@@ -346,7 +378,13 @@ client.on('interactionCreate', async interaction => {
         let desc = '';
         rows.forEach(r => {
             const unix = Math.floor(r.target_timestamp / 1000);
-            const targetTag = r.mention_type === 'here' ? '`@here` (Server)' : `<@${r.user_id}> (Pribadi)`;
+            let targetTag = `<@${r.user_id}> (Pribadi)`;
+            if (r.target_role_id) {
+                targetTag = `<@&${r.target_role_id}> (Role)`;
+            } else if (r.mention_type === 'here') {
+                targetTag = '`@here` (Server)';
+            }
+
             desc += `**#${r.id} | ${r.title}**\n`;
             desc += `• Waktu: <t:${unix}:F> (<t:${unix}:R>)\n`;
             desc += `• Target: ${targetTag} | Channel: <#${r.channel_id}>\n\n`;
