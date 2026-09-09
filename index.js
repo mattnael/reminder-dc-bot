@@ -8,7 +8,8 @@ const {
     SlashCommandBuilder, 
     EmbedBuilder, 
     MessageFlags,
-    PermissionFlagsBits
+    PermissionFlagsBits,
+    Options
 } = require('discord.js');
 const Database = require('better-sqlite3');
 const { DateTime } = require('luxon');
@@ -52,6 +53,12 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages
     ],
+    makeCache: Options.cacheWithLimits({
+        MessageManager: 0,
+        GuildMemberManager: 0,
+        UserManager: 0,
+        ThreadManager: 0
+    }),    
     allowedMentions: {
         parse: ['everyone', 'roles', 'users']
     }
